@@ -1,56 +1,76 @@
+
 import cv2
-import mediapipe as mp
+from step3_calibratedgaze import make_mesh, open_camera, eye_metrics
 
-# 1. Initialize Face Mesh with Iris landmarks enabled
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,  # Critical for landmarks 468 & 473
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+CAMERA_INDEX = 0
 
-# 2. Access the webcam (0 is default)
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+cap = open_camera(CAMERA_INDEX)
+mesh = make_mesh()
 
-if not cap.isOpened():
-    print("Error: Could not open webcam. Check Windows privacy settings.")
-    exit()
+try:
+    while True:
+        success, frame = cap.read()
+        if not success:
+            print("Camera frame read failed")
+            break
 
-print("Camera active. Press 'q' on your keyboard to quit.")
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = mesh.process(rgb)
 
-    frame = cv2.flip(frame, 1)  # Mirror view
-    h, w, _ = frame.shape
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb_frame)
+        if not results.multi_face_landmarks:
+            status = "NO FACE DETECTED"
+            color = (0, 0, 255)
 
-    if results.multi_face_landmarks:
-        mesh = results.multi_face_landmarks[0].landmark
-        
-        # Left and Right Iris center coordinates
-        left_iris = mesh[468]
-        right_iris = mesh[473]
+        else:
+            landmarks = results.multi_face_landmarks[0].landmark
 
-        lx, ly = int(left_iris.x * w), int(left_iris.y * h)
-        rx, ry = int(right_iris.x * w), int(right_iris.y * h)
+            # Draw iris centers
+            if len(landmarks) > 473:
+                for idx in (468, 473):
+                    p = landmarks[idx]
+                    x = int(p.x * w)
+                    y = int(p.y * h)
 
-        # Draw visual tracking dots
-        cv2.circle(frame, (lx, ly), 4, (0, 0, 255), -1)
-        cv2.circle(frame, (rx, ry), 4, (0, 0, 255), -1)
-        cv2.putText(frame, "Tracking Active", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    else:
-        cv2.putText(frame, "No face detected", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                    cv2.circle(
+                        frame, (x, y), 4,
+                        (0, 255, 0), -1
+                    )
 
-    cv2.imshow("Eyecomm - Step 1 Verification", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+            metrics = eye_metrics(landmarks, w, h)
 
-cap.release()
-cv2.destroyAllWindows()
+            if metrics is None:
+                status = "FACE FOUND - EYE METRICS INVALID"
+                color = (0, 165, 255)
+
+            elif metrics["ratio"] is None:
+                status = "FACE FOUND - IRIS RATIO INVALID"
+                color = (0, 165, 255)
+
+            else:
+                status = f"TRACKING OK - {metrics['ratio']:.3f}"
+                color = (0, 255, 0)
+
+        cv2.rectangle(
+            frame, (0, 0), (w, 65),
+            (30, 30, 30), -1
+        )
+
+        cv2.putText(
+            frame, status, (20, 43),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8, color, 2
+        )
+
+        cv2.imshow("EyeComm Camera Diagnostic", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            break
+
+finally:
+    cap.release()
+    mesh.close()
+    cv2.destroyAllWindows()

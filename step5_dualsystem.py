@@ -1,265 +1,461 @@
+
+"""EyeComm main app: calibration, blink verification and communication board."""
+import time
 import cv2
 import numpy as np
-import time
-import json
-import os
 
-try:
-    import mediapipe.python.solutions.face_mesh as mp_face_mesh
-except AttributeError:
-    import mediapipe as mp
-    mp_face_mesh = mp.solutions.face_mesh
-
-SETTINGS_FILE = "calibration_profile.json"
-
-# Landmarks from Table 4 of FYP 1 Report
-LEFT_EYE = [362, 385, 387, 263, 373, 380]
-RIGHT_EYE = [33, 160, 158, 133, 153, 144]
-LEFT_IRIS = 468
-RIGHT_IRIS = 473
-
-def calculate_ear(landmarks, indices, img_w, img_h):
-    pts = [np.array([landmarks[idx].x * img_w, landmarks[idx].y * img_h]) for idx in indices]
-    v1 = np.linalg.norm(pts[1] - pts[5])
-    v2 = np.linalg.norm(pts[2] - pts[4])
-    h = np.linalg.norm(pts[0] - pts[3])
-    return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
-
-def get_raw_iris_ratio(landmarks, eye_indices, iris_idx, img_w, img_h):
-    pts = np.array([[landmarks[i].x * img_w, landmarks[i].y * img_h] for i in eye_indices])
-    iris = np.array([landmarks[iris_idx].x * img_w, landmarks[iris_idx].y * img_h])
-    corner_left = min(pts[:, 0])
-    corner_right = max(pts[:, 0])
-    span = corner_right - corner_left
-    return (iris[0] - corner_left) / span if span > 0 else 0.5
-
-def save_profile(calib_data):
-    """FR-06: Persist calibration profile locally."""
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(calib_data, f, indent=4)
-
-def load_profile():
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-# Initialize FaceMesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+from step2_blinkdetector import BlinkDetector
+from step3_calibratedgaze import (
+    Calibrator, GazeFilter, Navigator, load_profile,
+    make_mesh, open_camera, read_frame, read_key,
 )
 
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+WORDS = ("YES", "NO", "WATER", "HELP", "TIRED", "CLEAR")
+WINDOW = "EyeComm - Webcam Communication"
+BG = (30, 24, 19)
+WHITE = (245, 245, 245)
+CYAN = (235, 205, 35)
+GREEN = (110, 230, 100)
 
-# Communication Cards
-ITEMS = ["YES", "NO", "WATER", "HELP", "TIRED", "CLEAR"]
-selected_idx = 0
-constructed_sentence = []
 
-# Operational States: 'CALIBRATING', 'BLINK_TEST', 'COMM_BOARD'
-calib = load_profile() or {"center": None, "left": None, "right": None}
-system_state = "COMM_BOARD" if (calib["center"] and calib["left"] and calib["right"]) else "CALIBRATING"
-calib_step = 1  # 1: Center, 2: Left, 3: Right
+def put(img, txt, x, y, size=0.75, color=WHITE, thick=2):
+    cv2.putText(
+        img, str(txt), (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        size, color, thick, cv2.LINE_AA
+    )
 
-# Caregiver Oversight Mode (Figure 2 Flowchart)
-caregiver_mode = False
 
-# Timing & Intent Thresholds
-EAR_THRESHOLD = 0.21
-DELIBERATE_BLINK_SEC = 0.40
-NAV_HOLD_SEC = 0.45
-COOLDOWN_SEC = 1.0
+def fit_text(text, max_pixels, scale):
+    text = str(text)
 
-blink_start = None
-is_blinking = False
-gaze_hold_start = None
-current_gaze_dir = "CENTER"
-last_action_time = 0
-blink_test_passed = False
+    while len(text) > 4 and cv2.getTextSize(
+            text, cv2.FONT_HERSHEY_SIMPLEX,
+            scale, 2)[0][0] > max_pixels:
+        text = text[:-5].rstrip(".") + "..."
 
-while cap.isOpened():
-    success, frame = cap.read()
-    if not success:
-        break
+    return text
 
-    frame = cv2.flip(frame, 1)
-    h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(rgb)
 
-    gaze_label = "CENTER"
-    curr_time = time.time()
-    tracking_quality = "POOR (No Face)"
-    ear_val = 0.0
-    ratio = 0.5
+def draw_calibration(screen, calib):
+    put(
+        screen,
+        "CALIBRATION - follow the highlighted dot",
+        42, 215, 0.88
+    )
 
-    if results.multi_face_landmarks:
-        mesh = results.multi_face_landmarks[0].landmark
-        tracking_quality = "EXCELLENT"
+    for label, x in (
+        ("LEFT", 165),
+        ("CENTER", 640),
+        ("RIGHT", 1115)
+    ):
+        active = label == calib.label
 
-        # 1. Compute EAR
-        ear_l = calculate_ear(mesh, LEFT_EYE, w, h)
-        ear_r = calculate_ear(mesh, RIGHT_EYE, w, h)
-        ear_val = (ear_l + ear_r) / 2.0
+        cv2.circle(
+            screen, (x, 340), 27,
+            CYAN if active else (92, 92, 92), -1
+        )
 
-        # 2. Blink Intent Parsing
-        deliberate_blink_fired = False
-        if ear_val < EAR_THRESHOLD:
-            if not is_blinking:
-                is_blinking = True
-                blink_start = curr_time
-        else:
-            if is_blinking:
-                duration = curr_time - blink_start
-                is_blinking = False
-                if duration >= DELIBERATE_BLINK_SEC:
-                    deliberate_blink_fired = True
+        put(
+            screen, label, x - 60, 404, 0.78,
+            WHITE if active else (150, 150, 150)
+        )
 
-        # 3. Gaze Displacement
-        ratio_l = get_raw_iris_ratio(mesh, LEFT_EYE, LEFT_IRIS, w, h)
-        ratio_r = get_raw_iris_ratio(mesh, RIGHT_EYE, RIGHT_IRIS, w, h)
-        ratio = (ratio_l + ratio_r) / 2.0
+    command = calib.TARGETS[calib.index][1].upper()
 
-        # 4. State Machine Logic
-        if system_state == "CALIBRATING":
-            pass  # Waiting for caregiver/user keypresses (C, L, R)
+    instruction = (
+        f"Recording {calib.label}... keep looking at the dot"
+        if calib.started is not None
+        else f"Look at {calib.label}; press {command} to record"
+    )
 
-        elif system_state == "BLINK_TEST":
-            # Flowchart Gateway: Blink Test Successful?
-            if deliberate_blink_fired:
-                blink_test_passed = True
-                system_state = "COMM_BOARD"
-                last_action_time = curr_time
+    put(screen, instruction, 42, 495, 0.85)
 
-        elif system_state == "COMM_BOARD":
-            # Gaze direction classification
-            left_thresh = (calib["center"] + calib["left"]) / 2.0
-            right_thresh = (calib["center"] + calib["right"]) / 2.0
+    if calib.error:
+        put(
+            screen,
+            fit_text(calib.error, 1170, 0.65),
+            42, 548, 0.65, (0, 170, 255)
+        )
 
-            if ratio < min(left_thresh, right_thresh):
-                gaze_label = "LEFT"
-            elif ratio > max(left_thresh, right_thresh):
-                gaze_label = "RIGHT"
+
+def draw_board(screen, selected, tokens):
+    cv2.rectangle(
+        screen, (32, 92), (1248, 173),
+        (45, 42, 37), -1
+    )
+
+    put(
+        screen, "MESSAGE",
+        52, 120, 0.56,
+        (155, 185, 202), 1
+    )
+
+    message = " ".join(tokens) if tokens else "No message yet"
+
+    put(
+        screen,
+        fit_text(message, 1160, 0.95),
+        52, 156, 0.95
+    )
+
+    gap = 16
+    left = 32
+    available = 1216
+    card_w = (available - 2 * gap) // 3
+
+    for idx, word in enumerate(WORDS):
+        row, col = divmod(idx, 3)
+
+        x1 = left + col * (card_w + gap)
+        y1 = 197 + row * 164
+        x2 = x1 + card_w
+        y2 = y1 + 147
+
+        active = idx == selected
+
+        cv2.rectangle(
+            screen, (x1, y1), (x2, y2),
+            (115, 85, 15) if active else (57, 52, 46),
+            -1
+        )
+
+        cv2.rectangle(
+            screen, (x1, y1), (x2, y2),
+            CYAN if active else (95, 90, 80),
+            3
+        )
+
+        text_size = cv2.getTextSize(
+            word, cv2.FONT_HERSHEY_SIMPLEX,
+            1.35, 3
+        )[0]
+
+        put(
+            screen, word,
+            x1 + (card_w - text_size[0]) // 2,
+            y1 + 80, 1.35, WHITE, 3
+        )
+
+
+def draw_screen(
+    state, frame, sample, calib, selected,
+    tokens, direction, notice, caregiver
+):
+    screen = np.zeros((720, 1280, 3), dtype=np.uint8)
+    screen[:] = BG
+
+    put(screen, "EYECOMM", 32, 54, 1.1, CYAN, 3)
+    put(screen, state.replace("_", " "), 270, 54, 0.75)
+
+    put(
+        screen, "Q: Quit   K: Calibrate   M: Caregiver",
+        715, 52, 0.55, (190, 190, 190), 1
+    )
+
+    if state == "CALIBRATING":
+        draw_calibration(screen, calib)
+
+    elif state == "BLINK_TEST":
+        put(
+            screen, "BLINK VERIFICATION",
+            125, 230, 1.3, CYAN, 3
+        )
+
+        put(
+            screen,
+            "Close BOTH eyes for 0.4-1.6 seconds, then reopen.",
+            125, 320, 0.85
+        )
+
+        put(
+            screen,
+            "A successful intentional blink unlocks the board.",
+            125, 385, 0.8
+        )
+
+    else:
+        draw_board(screen, selected, tokens)
+
+    cv2.line(
+        screen, (32, 560), (1248, 560),
+        (70, 70, 70), 2
+    )
+
+    status = (
+        f"Face: {'DETECTED' if sample else 'LOST'}  |  "
+        f"Gaze: {direction}  |  "
+        f"EAR: {sample['ear_left']:.2f}/{sample['ear_right']:.2f}"
+        if sample
+        else "TRACKING LOST - navigation and selection disabled"
+    )
+
+    put(
+        screen,
+        fit_text(status, 1130, 0.64),
+        38, 605, 0.64,
+        GREEN if sample else (50, 110, 245)
+    )
+
+    put(
+        screen,
+        fit_text(notice, 1160, 0.63),
+        38, 645, 0.63,
+        (255, 220, 125)
+    )
+
+    put(
+        screen,
+        "Center to re-arm | Look LEFT/RIGHT to move | Hold blink to select",
+        38, 687, 0.56,
+        (170, 170, 170), 1
+    )
+
+    if caregiver and frame is not None:
+        # Diagnostic camera thumbnail for caregiver observation.
+        thumb = cv2.resize(frame, (235, 132))
+        screen[565:697, 1020:1255] = thumb
+
+        cv2.rectangle(
+            screen,
+            (1020, 565), (1255, 697),
+            CYAN, 2
+        )
+
+    return screen
+
+
+def speak(text):
+    if not text:
+        return "Nothing to speak."
+
+    try:
+        import pyttsx3
+
+        engine = pyttsx3.init()
+        engine.say(text)
+        engine.runAndWait()
+        engine.stop()
+
+        return "Message spoken."
+
+    except Exception as exc:
+        return f"Speech unavailable: {type(exc).__name__}"
+
+
+def run_app(show_caregiver=False):
+    profile = load_profile()
+
+    state = "BLINK_TEST" if profile else "CALIBRATING"
+    calibrator = Calibrator()
+
+    blink = (
+        BlinkDetector(
+            profile["open_ear_left"],
+            profile["open_ear_right"]
+        )
+        if profile else None
+    )
+
+    gaze = GazeFilter(profile) if profile else None
+    nav = Navigator()
+
+    selected = 0
+    tokens = []
+    direction = "CENTER"
+    caregiver = show_caregiver
+
+    notice = (
+        "Saved profile loaded: verify deliberate blink."
+        if profile
+        else "No valid profile: calibration required."
+    )
+
+    last_select = float("-inf")
+
+    cap = open_camera()
+    mesh = make_mesh()
+
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW, 1280, 720)
+
+    try:
+        while True:
+            frame, sample = read_frame(cap, mesh)
+
+            if frame is None:
+                notice = "Camera read failed."
+                print(notice)
+                break
+
+            now = time.monotonic()
+
+            # ===================================
+            # STATE 1: CALIBRATION
+            # ===================================
+
+            if state == "CALIBRATING":
+                completed = calibrator.update(sample, now)
+
+                if completed is not None:
+                    profile = completed
+                    gaze = GazeFilter(profile)
+
+                    blink = BlinkDetector(
+                        profile["open_ear_left"],
+                        profile["open_ear_right"]
+                    )
+
+                    nav.reset()
+                    state = "BLINK_TEST"
+
+                    notice = (
+                        "Calibration saved. "
+                        "Verify your deliberate blink."
+                    )
+
+            # ===================================
+            # TRACKING LOST
+            # ===================================
+
+            elif sample is None:
+                blink.reset()
+                gaze.reset()
+                nav.reset()
+                direction = "LOST"
+
             else:
-                gaze_label = "CENTER"
+                event = blink.update(sample, now)
 
-            # Gaze navigation with dwell-hold
-            if not is_blinking:
-                if gaze_label != current_gaze_dir:
-                    current_gaze_dir = gaze_label
-                    gaze_hold_start = curr_time
-                else:
-                    if curr_time - last_action_time > COOLDOWN_SEC:
-                        if gaze_hold_start and (curr_time - gaze_hold_start >= NAV_HOLD_SEC):
-                            if gaze_label == "RIGHT" and selected_idx < len(ITEMS) - 1:
-                                selected_idx += 1
-                                last_action_time = curr_time
-                            elif gaze_label == "LEFT" and selected_idx > 0:
-                                selected_idx -= 1
-                                last_action_time = curr_time
+                # ===================================
+                # STATE 2: BLINK VERIFICATION
+                # ===================================
 
-            # Intent selection execution
-            if deliberate_blink_fired and (curr_time - last_action_time > COOLDOWN_SEC):
-                chosen = ITEMS[selected_idx]
-                if chosen == "CLEAR":
-                    constructed_sentence = []
-                else:
-                    constructed_sentence.append(chosen)
-                last_action_time = curr_time
+                if state == "BLINK_TEST":
+                    if event:
+                        state = "COMM_BOARD"
+                        last_select = now
 
-    # ================= UI & CAREGIVER LAYER =================
-    # Top Status Bar
-    cv2.rectangle(frame, (0, 0), (w, 55), (35, 35, 35), -1)
-    status_msg = f"State: {system_state} | Mode: {'[CareOver Oversight]' if caregiver_mode else '[Patient Input]'} | Press 'M' to toggle mode"
-    cv2.putText(frame, status_msg, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                        nav.reset()
+                        gaze.reset()
 
-    # 1. State: Calibrating Screen
-    if system_state == "CALIBRATING":
-        steps_text = {
-            1: "Step 1/3: Look straight at CENTER and press 'C'",
-            2: "Step 2/3: Glance over to the LEFT and press 'L'",
-            3: "Step 3/3: Glance over to the RIGHT and press 'R'"
-        }
-        cv2.putText(frame, steps_text[calib_step], (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-        cv2.putText(frame, f"Current Live Iris Ratio: {ratio:.3f}", (50, 230), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
+                        notice = (
+                            "Blink verified! "
+                            "Look center, then left/right."
+                        )
 
-    # 2. State: Blink Test Gateway Screen (Figure 2)
-    elif system_state == "BLINK_TEST":
-        cv2.putText(frame, "VALIDATION GATEWAY: Blink Test Verification", (50, 150),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 200, 255), 2)
-        cv2.putText(frame, "Please perform a deliberate blink (>0.4s) to unlock the board.", (50, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-        cv2.putText(frame, f"Current EAR: {ear_val:.2f} (Needs < {EAR_THRESHOLD})", (50, 250),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 255, 150), 2)
+                # ===================================
+                # STATE 3: COMMUNICATION BOARD
+                # ===================================
 
-    # 3. State: Active Communication Board
-    elif system_state == "COMM_BOARD":
-        sentence_str = " ".join(constructed_sentence)
-        cv2.rectangle(frame, (30, 80), (w - 30, 150), (20, 20, 20), -1)
-        cv2.putText(frame, f"Message: {sentence_str}", (45, 130),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                elif state == "COMM_BOARD":
 
-        card_width = int((w - 60) / len(ITEMS))
-        for i, word in enumerate(ITEMS):
-            x1 = 30 + i * card_width
-            y1 = 180
-            x2 = x1 + card_width - 15
-            y2 = 290
+                    if blink.eyes_closed:
+                        nav.reset()
+                        gaze.reset()
+                        direction = "BLINK"
 
-            if i == selected_idx:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 180, 0), -1)
-                cv2.putText(frame, word, (x1 + 10, y1 + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-            else:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (60, 60, 60), -1)
-                cv2.putText(frame, word, (x1 + 10, y1 + 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (220, 220, 220), 2)
+                    elif event:
+                        nav.reset()
+                        gaze.reset()
+                        direction = "CENTER"
 
-    # CareOver Diagnostic Panel (Caregiver Oversight Track)
-    if caregiver_mode:
-        panel_y = h - 180
-        cv2.rectangle(frame, (20, panel_y), (w - 20, h - 20), (15, 15, 15), -1)
-        cv2.rectangle(frame, (20, panel_y), (w - 20, h - 20), (0, 165, 255), 2)
-        cv2.putText(frame, "CAREGIVER DIAGNOSTICS & SYSTEM AUDIT", (35, panel_y + 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-        cv2.putText(frame, f"Tracking Quality: {tracking_quality}", (35, panel_y + 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0) if tracking_quality == "EXCELLENT" else (0, 0, 255), 2)
-        cv2.putText(frame, f"Live EAR: {ear_val:.2f} | Live Iris Ratio: {ratio:.3f} | Current Gaze: {gaze_label}", (35, panel_y + 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1)
-        cv2.putText(frame, "Controls: Press 'K' to force Recalibrate | Press 'S' to Speak/Assist Message", (35, panel_y + 135),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1)
+                        if now - last_select >= 0.70:
+                            word = WORDS[selected]
 
-    cv2.imshow("Eyecomm - Dual Track System", frame)
-    key = cv2.waitKey(1) & 0xFF
+                            if word == "CLEAR":
+                                tokens.clear()
+                            else:
+                                tokens.append(word)
 
-    # Keyboard Handlers (Caregiver / Calibration Keys)
-    if key == ord('m') or key == ord('M'):
-        caregiver_mode = not caregiver_mode
+                            notice = f"Selected: {word}"
+                            last_select = now
 
-    elif key == ord('k') or key == ord('K'):
-        system_state = "CALIBRATING"
-        calib_step = 1
+                    elif sample["ratio"] is None:
+                        gaze.reset()
+                        nav.reset()
+                        direction = "GAZE LOST"
 
-    elif system_state == "CALIBRATING":
-        if (key == ord('c') or key == ord('C')) and ratio is not None:
-            calib["center"] = ratio
-            calib_step = 2
-        elif (key == ord('l') or key == ord('L')) and ratio is not None:
-            calib["left"] = ratio
-            calib_step = 3
-        elif (key == ord('r') or key == ord('R')) and ratio is not None:
-            calib["right"] = ratio
-            save_profile(calib)
-            system_state = "BLINK_TEST"
+                    else:
+                        direction = gaze.update(sample["ratio"])
+                        step = nav.update(direction, now)
 
-    elif key == ord('q') or key == 27:
-        break
+                        if step:
+                            selected = max(
+                                0,
+                                min(
+                                    len(WORDS) - 1,
+                                    selected + step
+                                )
+                            )
 
-cap.release()
-cv2.destroyAllWindows()
+                            notice = (
+                                f"Highlighted: {WORDS[selected]}"
+                            )
+
+            # ===================================
+            # DRAW USER INTERFACE
+            # ===================================
+
+            screen = draw_screen(
+                state, frame, sample, calibrator,
+                selected, tokens, direction,
+                notice, caregiver
+            )
+
+            cv2.imshow(WINDOW, screen)
+
+            key = read_key()
+
+            # Exit
+            if key in (ord("q"), 27):
+                break
+
+            # Toggle caregiver preview
+            if key == ord("m"):
+                caregiver = not caregiver
+
+            # Recalibrate
+            elif key == ord("k"):
+                state = "CALIBRATING"
+                calibrator = Calibrator()
+
+                blink = None
+                gaze = None
+
+                nav.reset()
+                selected = 0
+
+                notice = "Manual recalibration started."
+
+            # Calibration keyboard commands
+            elif state == "CALIBRATING":
+                calibrator.begin(key, now, sample)
+
+            # Caregiver / message controls
+            elif state == "COMM_BOARD":
+
+                if key == ord("u") and tokens:
+                    tokens.pop()
+                    notice = "Last word removed."
+
+                elif key == ord("x"):
+                    tokens.clear()
+                    notice = "Message cleared."
+
+                elif key == ord("s"):
+                    notice = speak(" ".join(tokens))
+
+                    # Reset tracking state after speech.
+                    blink.reset()
+                    gaze.reset()
+                    nav.reset()
+
+    finally:
+        cap.release()
+        mesh.close()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    run_app(show_caregiver=True)
