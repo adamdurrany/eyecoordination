@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "tiles": [
+    {
+      "id": "YES",
+      "label": "YES",
+      "phrase": "Yes",
+      "action": "WORD"
+    },
+    {
+      "id": "NO",
+      "label": "NO",
+      "phrase": "No",
+      "action": "WORD"
+    },
+    {
+      "id": "WATER",
+      "label": "WATER",
+      "phrase": "I need water",
+      "action": "WORD"
+    },
+    {
+      "id": "HELP",
+      "label": "HELP",
+      "phrase": "I need help",
+      "action": "URGENT"
+    },
+    {
+      "id": "TIRED",
+      "label": "TIRED",
+      "phrase": "I am tired",
+      "action": "WORD"
+    },
+    {
+      "id": "SPEAK",
+      "label": "SPEAK / SEND",
+      "phrase": "",
+      "action": "SEND"
+    },
+    {
+      "id": "DELETE",
+      "label": "DELETE",
+      "phrase": "",
+      "action": "DELETE"
+    },
+    {
+      "id": "CLEAR",
+      "label": "CLEAR",
+      "phrase": "",
+      "action": "CLEAR"
+    }
+  ]
+}
