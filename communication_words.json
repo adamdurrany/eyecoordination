@@ -1,0 +1,40 @@
+{
+    "items": [
+        {
+            "label": "YES",
+            "spoken_phrase": "Yes",
+            "category": "Basic",
+            "action": "speak"
+        },
+        {
+            "label": "NO",
+            "spoken_phrase": "No",
+            "category": "Basic",
+            "action": "speak"
+        },
+        {
+            "label": "WATER",
+            "spoken_phrase": "I would like some water",
+            "category": "Needs",
+            "action": "speak"
+        },
+        {
+            "label": "HELP",
+            "spoken_phrase": "Help, I need assistance",
+            "category": "Emergency",
+            "action": "speak"
+        },
+        {
+            "label": "TIRED",
+            "spoken_phrase": "I am tired",
+            "category": "Physical",
+            "action": "speak"
+        },
+        {
+            "label": "CLEAR",
+            "spoken_phrase": "",
+            "category": "Controls",
+            "action": "clear"
+        }
+    ]
+}

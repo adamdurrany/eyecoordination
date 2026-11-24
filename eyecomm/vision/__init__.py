@@ -1,1 +1,0 @@
-"""EyeComm Python application package."""

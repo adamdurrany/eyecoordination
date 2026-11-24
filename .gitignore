@@ -1,10 +1,2 @@
-__pycache__/
-*.py[cod]
+
 .venv/
-venv/
-.env
-data/*.sqlite3
-data/calibration_profile.json
-build/
-dist/
-*.spec
