@@ -1,17 +1,25 @@
-
-"""EyeComm main app: calibration, blink verification and communication board."""
+"""EyeComm main app: calibration, blink verification, ML logging and communication board."""
 import time
 import cv2
 import numpy as np
 
 from speech_service import SpeechService
 from board_config import load_board
+from gaze_logger import EyeCommMLLogger
 
 from step2_blinkdetector import BlinkDetector
 from step3_calibratedgaze import (
     Calibrator, GazeFilter, Navigator, load_profile,
     make_mesh, open_camera, read_frame, read_key,
 )
+
+# ===================================
+# SESSION METADATA (UPDATE PER USER)
+# ===================================
+PARTICIPANT_ID = "ALS-P01"       # ALS-P01..P05 or UIA-S01..S20
+COHORT = "ALS_PATIENT"           # "ALS_PATIENT" (core dataset) or "HEALTHY_STUDENT" (generality test)
+GLASSES = "none"                 # "none", "standard", "anti-glare", or "contact_lens"
+LIGHTING = "bright"              # "bright", "dim", or "backlight"
 
 BOARD_ITEMS = load_board()
 WORDS = tuple(item["label"] for item in BOARD_ITEMS)
@@ -267,8 +275,21 @@ def run_app(show_caregiver=False):
     # Speech runs outside the camera loop so eye tracking stays responsive.
     speech = SpeechService()
 
+    # Initialise ML dataset logger & Random Forest classifier (auto-loads if trained)
+    ml_logger = EyeCommMLLogger(
+        participant_id=PARTICIPANT_ID,
+        cohort=COHORT,
+        glasses=GLASSES,
+        lighting=LIGHTING,
+    )
+    use_ml_model = ml_logger.model is not None
+    eval_target = "CENTER"
+    burst_remaining = 0
+
     if speech.error:
         notice = f"Speech unavailable: {speech.error}"
+    elif use_ml_model:
+        notice += " [ML RandomForest active]"
 
     cap = open_camera()
     mesh = make_mesh()
@@ -278,6 +299,7 @@ def run_app(show_caregiver=False):
 
     try:
         while True:
+            frame_start = time.perf_counter()
             frame, sample = read_frame(cap, mesh)
 
             if frame is None:
@@ -292,6 +314,10 @@ def run_app(show_caregiver=False):
             # ===================================
 
             if state == "CALIBRATING":
+                # Auto-log labeled gaze frames while user holds focus on the active calibration dot
+                if calibrator.started is not None and sample is not None and sample.get("ratio") is not None:
+                    ml_logger.log_frame(sample, calibrator.label, calibrator.label, frame_start, profile)
+
                 completed = calibrator.update(sample, now)
 
                 if completed is not None:
@@ -386,7 +412,14 @@ def run_app(show_caregiver=False):
                         direction = "GAZE LOST"
 
                     else:
-                        direction = gaze.update(sample["ratio"])
+                        rule_dir = gaze.update(sample["ratio"])
+                        ml_dir = ml_logger.predict(sample, profile)
+                        direction = ml_dir if (use_ml_model and ml_dir is not None) else rule_dir
+
+                        if burst_remaining > 0:
+                            ml_logger.log_frame(sample, eval_target, rule_dir, frame_start, profile)
+                            burst_remaining -= 1
+
                         step = nav.update(direction, now)
 
                         if step:
@@ -441,7 +474,7 @@ def run_app(show_caregiver=False):
             elif state == "CALIBRATING":
                 calibrator.begin(key, now, sample)
 
-            # Caregiver / message controls
+            # Caregiver / message / ML evaluation controls
             elif state == "COMM_BOARD":
 
                 if key == ord("u") and tokens:
@@ -477,9 +510,25 @@ def run_app(show_caregiver=False):
                     gaze.reset()
                     nav.reset()
 
+                elif key in (ord("1"), ord("2"), ord("3")):
+                    eval_target = {ord("1"): "LEFT", ord("2"): "CENTER", ord("3"): "RIGHT"}[key]
+                    notice = f"Eval target set to {eval_target} (press SPACE to log 30 frames)"
+
+                elif key == ord(" "):
+                    burst_remaining = 30
+                    notice = f"Recording 30 frames for {eval_target}..."
+
+                elif key == ord("g"):
+                    if ml_logger.model is not None:
+                        use_ml_model = not use_ml_model
+                        notice = f"Switched to {'ML RandomForest' if use_ml_model else 'Rule GazeFilter'}"
+                    else:
+                        notice = "Train models/als_gaze_rf.joblib first."
+
     finally:
-        # Stop the speech worker cleanly when EyeComm exits.
+        # Stop the speech worker and close CSV logger cleanly when EyeComm exits.
         speech.close()
+        ml_logger.close()
         cap.release()
         mesh.close()
         cv2.destroyAllWindows()

@@ -1,2 +1,7 @@
-
-.venv/
+venv/
+logs/
+models/
+thesis_figures/
+desktop.ini
+__pycache__/
+*.pyc
