@@ -1,8 +1,11 @@
-
-"""EyeComm main app: calibration, blink verification and communication board."""
+"""EyeComm main app: auto-calibration, blink verification, auto-eval ML logging and communication board."""
 import time
 import cv2
 import numpy as np
+
+from speech_service import SpeechService
+from board_config import load_board
+from gaze_logger import EyeCommMLLogger
 
 from step2_blinkdetector import BlinkDetector
 from step3_calibratedgaze import (
@@ -10,12 +13,22 @@ from step3_calibratedgaze import (
     make_mesh, open_camera, read_frame, read_key,
 )
 
-WORDS = ("YES", "NO", "WATER", "HELP", "TIRED", "CLEAR")
+# ===================================
+# SESSION METADATA (UPDATE PER USER)
+# ===================================
+PARTICIPANT_ID = "UIA-S01"       # ALS-P01..P05 atau UIA-S01..S20
+COHORT = "HEALTHY_STUDENT"       # "ALS_PATIENT" atau "HEALTHY_STUDENT"
+GLASSES = "none"                 # "none", "standard", "anti-glare", atau "contact_lens"
+LIGHTING = "bright"              # "bright", "dim", atau "backlight"
+
+BOARD_ITEMS = load_board()
+WORDS = tuple(item["label"] for item in BOARD_ITEMS)
 WINDOW = "EyeComm - Webcam Communication"
 BG = (30, 24, 19)
 WHITE = (245, 245, 245)
 CYAN = (235, 205, 35)
 GREEN = (110, 230, 100)
+RED = (60, 75, 245)
 
 
 def put(img, txt, x, y, size=0.75, color=WHITE, thick=2):
@@ -37,7 +50,7 @@ def fit_text(text, max_pixels, scale):
     return text
 
 
-def draw_calibration(screen, calib):
+def draw_calibration(screen, calib, auto_calib=False):
     put(
         screen,
         "CALIBRATION - follow the highlighted dot",
@@ -61,13 +74,12 @@ def draw_calibration(screen, calib):
             WHITE if active else (150, 150, 150)
         )
 
-    command = calib.TARGETS[calib.index][1].upper()
-
-    instruction = (
-        f"Recording {calib.label}... keep looking at the dot"
-        if calib.started is not None
-        else f"Look at {calib.label}; press {command} to record"
-    )
+    if calib.started is not None:
+        instruction = f"Recording {calib.label}... keep looking at the dot"
+    elif auto_calib:
+        instruction = f"Auto-Calibrate active: look at {calib.label}..."
+    else:
+        instruction = f"Look at {calib.label}; press SPACE once for Auto-Calibrate"
 
     put(screen, instruction, 42, 495, 0.85)
 
@@ -77,6 +89,35 @@ def draw_calibration(screen, calib):
             fit_text(calib.error, 1170, 0.65),
             42, 548, 0.65, (0, 170, 255)
         )
+
+
+def draw_auto_eval(screen, target_label, frames_done, frames_total):
+    put(
+        screen,
+        "AUTO ACCURACY TEST - Look at the RED dot (keep eyes open)",
+        42, 185, 0.85, CYAN, 2
+    )
+
+    for label, x in (
+        ("LEFT", 165),
+        ("CENTER", 640),
+        ("RIGHT", 1115)
+    ):
+        active = label == target_label
+        cv2.circle(
+            screen, (x, 330), 34 if active else 24,
+            RED if active else (80, 80, 80), -1
+        )
+        put(
+            screen, label, x - 60, 405, 0.85,
+            WHITE if active else (140, 140, 140), 2
+        )
+
+    put(
+        screen,
+        f"Recording {target_label}: {frames_done} / {frames_total} frames (~1 sec)",
+        42, 495, 0.85, GREEN, 2
+    )
 
 
 def draw_board(screen, selected, tokens):
@@ -92,7 +133,6 @@ def draw_board(screen, selected, tokens):
     )
 
     message = " ".join(tokens) if tokens else "No message yet"
-
     put(
         screen,
         fit_text(message, 1160, 0.95),
@@ -104,14 +144,12 @@ def draw_board(screen, selected, tokens):
     available = 1216
     card_w = (available - 2 * gap) // 3
 
-    for idx, word in enumerate(WORDS):
+    for idx, item in enumerate(BOARD_ITEMS):
         row, col = divmod(idx, 3)
-
         x1 = left + col * (card_w + gap)
         y1 = 197 + row * 164
         x2 = x1 + card_w
         y2 = y1 + 147
-
         active = idx == selected
 
         cv2.rectangle(
@@ -119,28 +157,36 @@ def draw_board(screen, selected, tokens):
             (115, 85, 15) if active else (57, 52, 46),
             -1
         )
-
         cv2.rectangle(
             screen, (x1, y1), (x2, y2),
             CYAN if active else (95, 90, 80),
             3
         )
 
+        label = item["label"]
+        category = item["category"]
         text_size = cv2.getTextSize(
-            word, cv2.FONT_HERSHEY_SIMPLEX,
-            1.35, 3
+            label, cv2.FONT_HERSHEY_SIMPLEX, 1.25, 3
         )[0]
-
         put(
-            screen, word,
+            screen, label,
             x1 + (card_w - text_size[0]) // 2,
-            y1 + 80, 1.35, WHITE, 3
+            y1 + 78, 1.25, WHITE, 3
+        )
+        cat_size = cv2.getTextSize(
+            category, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1
+        )[0]
+        put(
+            screen, category.upper(),
+            x1 + (card_w - cat_size[0]) // 2,
+            y1 + 119, 0.48, (190, 190, 190), 1
         )
 
 
 def draw_screen(
     state, frame, sample, calib, selected,
-    tokens, direction, notice, caregiver
+    tokens, direction, notice, caregiver,
+    auto_eval_info=None, auto_calib=False
 ):
     screen = np.zeros((720, 1280, 3), dtype=np.uint8)
     screen[:] = BG
@@ -149,12 +195,12 @@ def draw_screen(
     put(screen, state.replace("_", " "), 270, 54, 0.75)
 
     put(
-        screen, "Q: Quit   K: Calibrate   M: Caregiver",
-        715, 52, 0.55, (190, 190, 190), 1
+        screen, "Q: Quit   K: Calibrate   T: Auto-Test (4.5s)   M: Caregiver",
+        560, 52, 0.55, (190, 190, 190), 1
     )
 
     if state == "CALIBRATING":
-        draw_calibration(screen, calib)
+        draw_calibration(screen, calib, auto_calib)
 
     elif state == "BLINK_TEST":
         put(
@@ -173,6 +219,9 @@ def draw_screen(
             "A successful intentional blink unlocks the board.",
             125, 385, 0.8
         )
+
+    elif auto_eval_info is not None:
+        draw_auto_eval(screen, *auto_eval_info)
 
     else:
         draw_board(screen, selected, tokens)
@@ -206,13 +255,12 @@ def draw_screen(
 
     put(
         screen,
-        "Center to re-arm | Look LEFT/RIGHT to move | Hold blink to select",
-        38, 687, 0.56,
+        "Center to re-arm | Look LEFT/RIGHT to move | Hold blink to select | T: Auto-Log 90 frames",
+        38, 687, 0.55,
         (170, 170, 170), 1
     )
 
     if caregiver and frame is not None:
-        # Diagnostic camera thumbnail for caregiver observation.
         thumb = cv2.resize(frame, (235, 132))
         screen[565:697, 1020:1255] = thumb
 
@@ -223,24 +271,6 @@ def draw_screen(
         )
 
     return screen
-
-
-def speak(text):
-    if not text:
-        return "Nothing to speak."
-
-    try:
-        import pyttsx3
-
-        engine = pyttsx3.init()
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
-
-        return "Message spoken."
-
-    except Exception as exc:
-        return f"Speech unavailable: {type(exc).__name__}"
 
 
 def run_app(show_caregiver=False):
@@ -268,10 +298,36 @@ def run_app(show_caregiver=False):
     notice = (
         "Saved profile loaded: verify deliberate blink."
         if profile
-        else "No valid profile: calibration required."
+        else "No valid profile: press SPACE to auto-calibrate."
     )
 
     last_select = float("-inf")
+    speech = SpeechService()
+
+    ml_logger = EyeCommMLLogger(
+        participant_id=PARTICIPANT_ID,
+        cohort=COHORT,
+        glasses=GLASSES,
+        lighting=LIGHTING,
+    )
+    use_ml_model = ml_logger.model is not None
+
+    # One-button auto-calibration state
+    auto_calib = False
+    auto_calib_wait_start = 0.0
+
+    # One-button automatic evaluation state (LEFT -> CENTER -> RIGHT, 30 frames each)
+    AUTO_TARGETS = ["LEFT", "CENTER", "RIGHT"]
+    FRAMES_PER_TARGET = 30
+    auto_eval_active = False
+    auto_stage = 0
+    auto_frames_done = 0
+    auto_stage_start = 0.0
+
+    if speech.error:
+        notice = f"Speech unavailable: {speech.error}"
+    elif use_ml_model:
+        notice += " [ML RandomForest active]"
 
     cap = open_camera()
     mesh = make_mesh()
@@ -281,6 +337,7 @@ def run_app(show_caregiver=False):
 
     try:
         while True:
+            frame_start = time.perf_counter()
             frame, sample = read_frame(cap, mesh)
 
             if frame is None:
@@ -289,17 +346,28 @@ def run_app(show_caregiver=False):
                 break
 
             now = time.monotonic()
+            auto_eval_info = None
 
             # ===================================
-            # STATE 1: CALIBRATION
+            # STATE 1: CALIBRATION (1-BUTTON AUTO)
             # ===================================
 
             if state == "CALIBRATING":
+                if auto_calib and sample is not None:
+                    if calibrator.started is None:
+                        if (now - auto_calib_wait_start) >= 1.20:
+                            cmd_char = calibrator.TARGETS[calibrator.index][1]
+                            calibrator.begin(ord(cmd_char), now, sample)
+                            auto_calib_wait_start = now
+                    else:
+                        auto_calib_wait_start = now
+
                 completed = calibrator.update(sample, now)
 
                 if completed is not None:
                     profile = completed
                     gaze = GazeFilter(profile)
+                    auto_calib = False
 
                     blink = BlinkDetector(
                         profile["open_ear_left"],
@@ -310,8 +378,8 @@ def run_app(show_caregiver=False):
                     state = "BLINK_TEST"
 
                     notice = (
-                        "Calibration saved. "
-                        "Verify your deliberate blink."
+                        "Calibration saved! "
+                        "Close both eyes ~1s to verify blink."
                     )
 
             # ===================================
@@ -340,8 +408,8 @@ def run_app(show_caregiver=False):
                         gaze.reset()
 
                         notice = (
-                            "Blink verified! "
-                            "Look center, then left/right."
+                            "Blink verified! Press T once for 4.5s auto-test, "
+                            "or look left/right to use board."
                         )
 
                 # ===================================
@@ -350,7 +418,35 @@ def run_app(show_caregiver=False):
 
                 elif state == "COMM_BOARD":
 
-                    if blink.eyes_closed:
+                    # Guided 1-button auto logging sequence
+                    if auto_eval_active and sample["ratio"] is not None:
+                        target_lbl = AUTO_TARGETS[auto_stage]
+                        rule_dir = gaze.update(sample["ratio"])
+                        ml_dir = ml_logger.predict(sample, profile)
+                        direction = ml_dir if (use_ml_model and ml_dir is not None) else rule_dir
+
+                        # Give user 0.6s eye-shift buffer before logging 30 frames
+                        if (now - auto_stage_start) >= 0.60 and not blink.eyes_closed:
+                            ml_logger.log_frame(sample, target_lbl, rule_dir, frame_start, profile)
+                            auto_frames_done += 1
+
+                        auto_eval_info = (target_lbl, auto_frames_done, FRAMES_PER_TARGET)
+
+                        if auto_frames_done >= FRAMES_PER_TARGET:
+                            auto_stage += 1
+                            auto_frames_done = 0
+                            auto_stage_start = now
+
+                            if auto_stage >= len(AUTO_TARGETS):
+                                auto_eval_active = False
+                                auto_eval_info = None
+                                nav.reset()
+                                gaze.reset()
+                                notice = f"Done! 90 frames logged for {PARTICIPANT_ID}."
+                            else:
+                                notice = f"Now look at {AUTO_TARGETS[auto_stage]}..."
+
+                    elif blink.eyes_closed:
                         nav.reset()
                         gaze.reset()
                         direction = "BLINK"
@@ -361,14 +457,25 @@ def run_app(show_caregiver=False):
                         direction = "CENTER"
 
                         if now - last_select >= 0.70:
-                            word = WORDS[selected]
+                            item = BOARD_ITEMS[selected]
+                            word = item["label"]
 
-                            if word == "CLEAR":
+                            if item["action"] == "clear":
                                 tokens.clear()
+                                notice = "Message cleared."
                             else:
                                 tokens.append(word)
 
-                            notice = f"Selected: {word}"
+                                queued = speech.speak(item["spoken_phrase"])
+                                if queued:
+                                    notice = f"Selected; speaking: {word}"
+                                else:
+                                    notice = (
+                                        "Speech failed: "
+                                        + (speech.error or "speech engine is not ready")
+                                    )
+                                    print(notice)
+
                             last_select = now
 
                     elif sample["ratio"] is None:
@@ -377,7 +484,10 @@ def run_app(show_caregiver=False):
                         direction = "GAZE LOST"
 
                     else:
-                        direction = gaze.update(sample["ratio"])
+                        rule_dir = gaze.update(sample["ratio"])
+                        ml_dir = ml_logger.predict(sample, profile)
+                        direction = ml_dir if (use_ml_model and ml_dir is not None) else rule_dir
+
                         step = nav.update(direction, now)
 
                         if step:
@@ -400,25 +510,24 @@ def run_app(show_caregiver=False):
             screen = draw_screen(
                 state, frame, sample, calibrator,
                 selected, tokens, direction,
-                notice, caregiver
+                notice, caregiver, auto_eval_info, auto_calib
             )
 
             cv2.imshow(WINDOW, screen)
 
             key = read_key()
 
-            # Exit
             if key in (ord("q"), 27):
                 break
 
-            # Toggle caregiver preview
             if key == ord("m"):
                 caregiver = not caregiver
 
-            # Recalibrate
             elif key == ord("k"):
                 state = "CALIBRATING"
                 calibrator = Calibrator()
+                auto_calib = False
+                auto_eval_active = False
 
                 blink = None
                 gaze = None
@@ -426,16 +535,26 @@ def run_app(show_caregiver=False):
                 nav.reset()
                 selected = 0
 
-                notice = "Manual recalibration started."
+                notice = "Press SPACE once to auto-calibrate LEFT -> CENTER -> RIGHT."
 
-            # Calibration keyboard commands
             elif state == "CALIBRATING":
-                calibrator.begin(key, now, sample)
+                if key == ord(" "):
+                    auto_calib = True
+                    auto_calib_wait_start = now - 1.20
+                    notice = "Auto-Calibrating LEFT -> CENTER -> RIGHT..."
+                else:
+                    calibrator.begin(key, now, sample)
 
-            # Caregiver / message controls
             elif state == "COMM_BOARD":
 
-                if key == ord("u") and tokens:
+                if key == ord("t") and not auto_eval_active:
+                    auto_eval_active = True
+                    auto_stage = 0
+                    auto_frames_done = 0
+                    auto_stage_start = now
+                    notice = "Auto-Test started! Follow the RED dot: LEFT -> CENTER -> RIGHT"
+
+                elif key == ord("u") and tokens:
                     tokens.pop()
                     notice = "Last word removed."
 
@@ -444,14 +563,39 @@ def run_app(show_caregiver=False):
                     notice = "Message cleared."
 
                 elif key == ord("s"):
-                    notice = speak(" ".join(tokens))
+                    selected_phrases = [
+                        item["spoken_phrase"]
+                        for token in tokens
+                        for item in BOARD_ITEMS
+                        if item["label"] == token and item["action"] == "speak"
+                    ]
+                    message = " ".join(selected_phrases).strip()
+                    if message:
+                        if speech.speak(message):
+                            notice = "Complete message queued for speech."
+                        else:
+                            notice = (
+                                "Speech failed: "
+                                + (speech.error or "speech engine is not ready")
+                            )
+                            print(notice)
+                    else:
+                        notice = "No message to speak."
 
-                    # Reset tracking state after speech.
                     blink.reset()
                     gaze.reset()
                     nav.reset()
 
+                elif key == ord("g"):
+                    if ml_logger.model is not None:
+                        use_ml_model = not use_ml_model
+                        notice = f"Switched to {'ML RandomForest' if use_ml_model else 'Rule GazeFilter'}"
+                    else:
+                        notice = "Train models/als_gaze_rf.joblib first."
+
     finally:
+        speech.close()
+        ml_logger.close()
         cap.release()
         mesh.close()
         cv2.destroyAllWindows()
